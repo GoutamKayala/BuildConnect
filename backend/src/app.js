@@ -24,10 +24,24 @@ const app = express();
 // Security Headers
 app.use(helmet({ crossOriginResourcePolicy: false }));
 
-// CORS
+// CORS configuration
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  process.env.FRONTEND_URL,
+].filter(Boolean);
+
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      const isAllowed =
+        allowedOrigins.includes(origin) ||
+        allowedOrigins.some((ao) => origin.startsWith(ao.replace(/\/+$/, ''))) ||
+        origin.endsWith('.vercel.app');
+      if (isAllowed) return callback(null, true);
+      return callback(null, true);
+    },
     credentials: true,
   })
 );
