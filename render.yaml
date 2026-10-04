@@ -1,0 +1,60 @@
+services:
+  # 1. Backend Web Service (Node.js API + Socket.io)
+  - type: web
+    name: buildconnect-backend
+    runtime: node
+    plan: free
+    region: oregon
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: node src/server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 5000
+      - key: MONGO_URI
+        sync: false
+      - key: JWT_ACCESS_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      - key: JWT_ACCESS_EXPIRY
+        value: 15m
+      - key: JWT_REFRESH_EXPIRY
+        value: 7d
+      - key: STORAGE_MODE
+        value: local
+      - key: UPLOAD_DIR
+        value: uploads
+      - key: FRONTEND_URL
+        fromService:
+          type: web
+          name: buildconnect-frontend
+          property: host
+
+  # 2. Frontend Static Site (React + Vite)
+  - type: web
+    name: buildconnect-frontend
+    runtime: static
+    plan: free
+    region: oregon
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_API_URL
+        fromService:
+          type: web
+          name: buildconnect-backend
+          property: host
+          path: /api
+      - key: VITE_SOCKET_URL
+        fromService:
+          type: web
+          name: buildconnect-backend
+          property: host
