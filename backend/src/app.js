@@ -31,10 +31,16 @@ const app = express();
 app.use(helmet({ crossOriginResourcePolicy: false }));
 
 // CORS configuration
+const rawFrontend = process.env.FRONTEND_URL ? process.env.FRONTEND_URL.trim() : '';
+const cleanFrontend = rawFrontend.replace(/\/+$/, '');
 const allowedOrigins = [
   'http://localhost:5173',
   'http://127.0.0.1:5173',
-  process.env.FRONTEND_URL,
+  'http://localhost:5000',
+  'http://127.0.0.1:5000',
+  cleanFrontend,
+  cleanFrontend && !/^https?:\/\//i.test(cleanFrontend) ? `https://${cleanFrontend}` : null,
+  cleanFrontend && !/^https?:\/\//i.test(cleanFrontend) ? `http://${cleanFrontend}` : null,
 ].filter(Boolean);
 
 app.use(
@@ -44,11 +50,16 @@ app.use(
       const isAllowed =
         allowedOrigins.includes(origin) ||
         allowedOrigins.some((ao) => origin.startsWith(ao.replace(/\/+$/, ''))) ||
-        origin.endsWith('.vercel.app');
+        origin.endsWith('.vercel.app') ||
+        origin.endsWith('.onrender.com') ||
+        origin.includes('localhost') ||
+        origin.includes('127.0.0.1');
       if (isAllowed) return callback(null, true);
       return callback(null, true);
     },
     credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-requested-with'],
   })
 );
 

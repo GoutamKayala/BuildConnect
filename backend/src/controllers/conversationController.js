@@ -1,3 +1,4 @@
+import mongoose from 'mongoose';
 import Conversation from '../models/Conversation.js';
 import Message from '../models/Message.js';
 import Project from '../models/Project.js';
@@ -13,27 +14,41 @@ import Invoice from '../models/Invoice.js';
 import { ApiError, asyncHandler } from '../utils/asyncHandler.js';
 import { getIO } from '../services/socketService.js';
 
+const toIdString = (val) => {
+  if (!val) return null;
+  if (typeof val === 'string') return val;
+  if (val._id) return val._id.toString();
+  if (typeof val.toString === 'function') return val.toString();
+  return String(val);
+};
+
 const safeEmit = (conversationId, recipientId, senderId, eventName, payload) => {
   try {
     const io = getIO();
     if (!io) return;
-    if (conversationId) io.to(`conversation:${conversationId}`).emit(eventName, payload);
-    if (recipientId) io.to(`user:${recipientId}`).emit(eventName, payload);
-    if (senderId) io.to(`user:${senderId}`).emit(eventName, payload);
-  } catch (e) {}
+    const cId = toIdString(conversationId);
+    const rId = toIdString(recipientId);
+    const sId = toIdString(senderId);
+    if (cId) io.to(`conversation:${cId}`).emit(eventName, payload);
+    if (rId) io.to(`user:${rId}`).emit(eventName, payload);
+    if (sId) io.to(`user:${sId}`).emit(eventName, payload);
+  } catch (e) {
+    console.warn('[Socket safeEmit warning]', e.message);
+  }
 };
 
 export const getConversations = asyncHandler(async (req, res) => {
   const { projectId, recipientId } = req.query;
+  const userOid = new mongoose.Types.ObjectId(req.user._id);
   const filter = {
-    'participants.user': req.user._id,
+    'participants.user': userOid,
   };
 
-  if (projectId) {
-    filter.project = projectId;
+  if (projectId && mongoose.Types.ObjectId.isValid(projectId)) {
+    filter.project = new mongoose.Types.ObjectId(projectId);
   }
-  if (recipientId) {
-    filter['participants.user'] = { $all: [req.user._id, recipientId] };
+  if (recipientId && mongoose.Types.ObjectId.isValid(recipientId)) {
+    filter['participants.user'] = { $all: [userOid, new mongoose.Types.ObjectId(recipientId)] };
   }
 
   const conversations = await Conversation.find(filter)
@@ -49,24 +64,60 @@ export const getConversations = asyncHandler(async (req, res) => {
   });
 });
 
+export const getConversationById = asyncHandler(async (req, res) => {
+  const { conversationId } = req.params;
+  if (!conversationId || !mongoose.Types.ObjectId.isValid(conversationId)) {
+    throw new ApiError(400, 'Invalid conversation ID.');
+  }
+
+  const conversation = await Conversation.findById(conversationId)
+    .populate('participants.user', 'name avatarUrl role city email phone')
+    .populate('project', 'title category stage status')
+    .populate('lastMessage');
+
+  if (!conversation) {
+    throw new ApiError(404, 'Conversation not found.');
+  }
+
+  const isParticipant = conversation.participants.some(
+    (p) => toIdString(p.user) === req.user._id.toString()
+  );
+
+  if (!isParticipant && req.user.role !== 'ADMIN') {
+    throw new ApiError(403, 'Unauthorized access to this conversation.');
+  }
+
+  res.json({
+    success: true,
+    conversation,
+  });
+});
+
 export const findOrCreateConversation = asyncHandler(async (req, res) => {
   const { projectId, recipientId } = req.body;
+  const userOid = new mongoose.Types.ObjectId(req.user._id);
+  const recipientOid = recipientId && mongoose.Types.ObjectId.isValid(recipientId)
+    ? new mongoose.Types.ObjectId(recipientId)
+    : null;
+  const projectOid = projectId && mongoose.Types.ObjectId.isValid(projectId)
+    ? new mongoose.Types.ObjectId(projectId)
+    : null;
 
   let conversation = null;
 
-  if (projectId) {
+  if (projectOid) {
     conversation = await Conversation.findOne({
-      project: projectId,
-      'participants.user': req.user._id,
+      project: projectOid,
+      'participants.user': userOid,
     })
       .populate('participants.user', 'name avatarUrl role city email phone')
       .populate('project', 'title category stage status')
       .populate('lastMessage');
   }
 
-  if (!conversation && recipientId) {
+  if (!conversation && recipientOid) {
     conversation = await Conversation.findOne({
-      'participants.user': { $all: [req.user._id, recipientId] },
+      'participants.user': { $all: [userOid, recipientOid] },
     })
       .populate('participants.user', 'name avatarUrl role city email phone')
       .populate('project', 'title category stage status')
@@ -76,8 +127,8 @@ export const findOrCreateConversation = asyncHandler(async (req, res) => {
   if (!conversation) {
     let actualRecipientId = recipientId;
 
-    if (projectId && !actualRecipientId) {
-      const projObj = await Project.findById(projectId);
+    if (projectOid && !actualRecipientId) {
+      const projObj = await Project.findById(projectOid);
       if (projObj) {
         if (projObj.client.toString() === req.user._id.toString()) {
           actualRecipientId = projObj.assignedWorker;
@@ -87,15 +138,15 @@ export const findOrCreateConversation = asyncHandler(async (req, res) => {
       }
     }
 
-    if (actualRecipientId) {
+    if (actualRecipientId && mongoose.Types.ObjectId.isValid(actualRecipientId)) {
       const recipientUser = await User.findById(actualRecipientId);
       const recipientRole = recipientUser?.role || (req.user.role === 'CLIENT' ? 'WORKER' : 'CLIENT');
 
       const createdConv = await Conversation.create({
-        ...(projectId ? { project: projectId } : {}),
+        ...(projectOid ? { project: projectOid } : {}),
         participants: [
-          { user: req.user._id, role: req.user.role },
-          { user: actualRecipientId, role: recipientRole },
+          { user: userOid, role: req.user.role },
+          { user: new mongoose.Types.ObjectId(actualRecipientId), role: recipientRole },
         ],
       });
 
@@ -112,27 +163,32 @@ export const findOrCreateConversation = asyncHandler(async (req, res) => {
 });
 
 export const getMessagesByConversation = asyncHandler(async (req, res) => {
-  const conversation = await Conversation.findById(req.params.conversationId);
+  const { conversationId } = req.params;
+  if (!conversationId || !mongoose.Types.ObjectId.isValid(conversationId)) {
+    throw new ApiError(400, 'Invalid conversation ID.');
+  }
+
+  const conversation = await Conversation.findById(conversationId);
 
   if (!conversation) {
     throw new ApiError(404, 'Conversation not found.');
   }
 
   const isParticipant = conversation.participants.some(
-    (p) => p.user.toString() === req.user._id.toString()
+    (p) => toIdString(p.user) === req.user._id.toString()
   );
 
   if (!isParticipant && req.user.role !== 'ADMIN') {
     throw new ApiError(403, 'Unauthorized access to this conversation.');
   }
 
-  const messages = await Message.find({ conversation: req.params.conversationId })
+  const messages = await Message.find({ conversation: conversationId })
     .populate('sender', 'name avatarUrl role')
     .sort({ createdAt: 1 });
 
   // Mark unread messages as read
   await Message.updateMany(
-    { conversation: req.params.conversationId, recipient: req.user._id, isRead: false },
+    { conversation: conversationId, recipient: req.user._id, isRead: false },
     { isRead: true, readAt: new Date() }
   );
 
@@ -156,26 +212,32 @@ export const sendMessage = asyncHandler(async (req, res) => {
     metadata,
   } = req.body;
 
+  const userOid = new mongoose.Types.ObjectId(req.user._id);
   let conversation;
 
-  if (conversationId) {
+  if (conversationId && mongoose.Types.ObjectId.isValid(conversationId)) {
     conversation = await Conversation.findById(conversationId);
-  } else if (recipientId) {
+  } else if (recipientId && mongoose.Types.ObjectId.isValid(recipientId)) {
+    const recipientOid = new mongoose.Types.ObjectId(recipientId);
+    const projectOid = projectId && mongoose.Types.ObjectId.isValid(projectId)
+      ? new mongoose.Types.ObjectId(projectId)
+      : null;
+
     // Find existing direct conversation between these two users
     conversation = await Conversation.findOne({
-      ...(projectId ? { project: projectId } : {}),
-      'participants.user': { $all: [req.user._id, recipientId] },
+      ...(projectOid ? { project: projectOid } : {}),
+      'participants.user': { $all: [userOid, recipientOid] },
     });
 
     if (!conversation) {
-      const recipientUser = await User.findById(recipientId);
+      const recipientUser = await User.findById(recipientOid);
       const recipientRole = recipientUser?.role || (req.user.role === 'CLIENT' ? 'WORKER' : 'CLIENT');
 
       conversation = await Conversation.create({
-        ...(projectId ? { project: projectId } : {}),
+        ...(projectOid ? { project: projectOid } : {}),
         participants: [
-          { user: req.user._id, role: req.user.role },
-          { user: recipientId, role: recipientRole },
+          { user: userOid, role: req.user.role },
+          { user: recipientOid, role: recipientRole },
         ],
       });
     }
@@ -186,10 +248,10 @@ export const sendMessage = asyncHandler(async (req, res) => {
   }
 
   const otherParticipant = conversation.participants.find(
-    (p) => p.user.toString() !== req.user._id.toString()
+    (p) => toIdString(p.user) !== req.user._id.toString()
   );
 
-  const targetRecipientId = recipientId || (otherParticipant ? otherParticipant.user : null);
+  const targetRecipientId = toIdString(recipientId) || (otherParticipant ? toIdString(otherParticipant.user) : null);
 
   if (!targetRecipientId) {
     throw new ApiError(400, 'Recipient required');
@@ -328,9 +390,9 @@ export const handleMessageAction = asyncHandler(async (req, res) => {
     }
 
     const otherParticipant = conversation.participants.find(
-      (p) => p.user.toString() !== req.user._id.toString()
+      (p) => toIdString(p.user) !== req.user._id.toString()
     );
-    const targetRecipientId = otherParticipant ? otherParticipant.user : message.sender;
+    const targetRecipientId = toIdString(otherParticipant ? otherParticipant.user : message.sender);
 
     const visitDateStr = message.locationData?.visitDate
       ? new Date(message.locationData.visitDate).toLocaleDateString()
@@ -397,9 +459,9 @@ export const handleMessageAction = asyncHandler(async (req, res) => {
     }
 
     const otherParticipant = conversation.participants.find(
-      (p) => p.user.toString() !== req.user._id.toString()
+      (p) => toIdString(p.user) !== req.user._id.toString()
     );
-    const targetRecipientId = otherParticipant ? otherParticipant.user : message.sender;
+    const targetRecipientId = toIdString(otherParticipant ? otherParticipant.user : message.sender);
 
     const replyMsg = await Message.create({
       conversation: conversation._id,
@@ -495,9 +557,9 @@ export const handleMessageAction = asyncHandler(async (req, res) => {
     });
 
     const otherParticipant = conversation.participants.find(
-      (p) => p.user.toString() !== req.user._id.toString()
+      (p) => toIdString(p.user) !== req.user._id.toString()
     );
-    const targetRecipientId = otherParticipant ? otherParticipant.user : message.sender;
+    const targetRecipientId = toIdString(otherParticipant ? otherParticipant.user : message.sender);
 
     const quoteMsg = await Message.create({
       conversation: conversation._id,
@@ -650,9 +712,9 @@ export const handleMessageAction = asyncHandler(async (req, res) => {
     }
 
     const otherParticipant = conversation.participants.find(
-      (p) => p.user.toString() !== req.user._id.toString()
+      (p) => toIdString(p.user) !== req.user._id.toString()
     );
-    const targetRecipientId = otherParticipant ? otherParticipant.user : message.sender;
+    const targetRecipientId = toIdString(otherParticipant ? otherParticipant.user : message.sender);
 
     // Post finalized deal celebratory message with in-app payment details
     const replyMsg = await Message.create({

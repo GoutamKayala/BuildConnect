@@ -8,7 +8,12 @@ export const initSocket = (server) => {
     cors: {
       origin: (origin, callback) => callback(null, true),
       credentials: true,
+      methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+      allowedHeaders: ['Content-Type', 'Authorization', 'x-requested-with'],
     },
+    transports: ['polling', 'websocket'],
+    pingTimeout: 60000,
+    pingInterval: 25000,
   });
 
   io.use((socket, next) => {
@@ -39,7 +44,13 @@ export const initSocket = (server) => {
           token,
           process.env.JWT_ACCESS_SECRET || 'buildconnect_access_secret_super_secure_key_2026!@#$'
         );
-        socket.user = decoded;
+        const uId = (decoded.id || decoded._id || '').toString();
+        socket.user = {
+          ...decoded,
+          id: uId,
+          _id: uId,
+          role: decoded.role || 'CLIENT',
+        };
         return next();
       } catch (err) {
         // Fallback to userId if JWT expired or failed
@@ -48,7 +59,12 @@ export const initSocket = (server) => {
 
     const userId = socket.handshake.auth?.userId;
     if (userId) {
-      socket.user = { id: userId.toString(), role: socket.handshake.auth?.role || 'CLIENT' };
+      const uId = userId.toString();
+      socket.user = {
+        id: uId,
+        _id: uId,
+        role: socket.handshake.auth?.role || 'CLIENT',
+      };
       return next();
     }
 
@@ -56,25 +72,39 @@ export const initSocket = (server) => {
   });
 
   io.on('connection', (socket) => {
-    console.log(`[Socket.IO] Client connected: ${socket.user.id} (${socket.id})`);
+    const userId = socket.user?.id || socket.user?._id;
+    console.log(`[Socket.IO] Client connected: ${userId} (${socket.id})`);
 
-    socket.join(`user:${socket.user.id}`);
+    if (userId) {
+      socket.join(`user:${userId}`);
+    }
 
     socket.on('join_conversation', (conversationId) => {
-      socket.join(`conversation:${conversationId}`);
-      console.log(`[Socket.IO] User ${socket.user.id} joined conversation:${conversationId}`);
+      if (!conversationId) return;
+      const room = `conversation:${conversationId}`;
+      socket.join(room);
+      console.log(`[Socket.IO] User ${userId} joined room ${room}`);
+    });
+
+    socket.on('leave_conversation', (conversationId) => {
+      if (!conversationId) return;
+      const room = `conversation:${conversationId}`;
+      socket.leave(room);
+      console.log(`[Socket.IO] User ${userId} left room ${room}`);
     });
 
     socket.on('typing_start', ({ conversationId }) => {
+      if (!conversationId) return;
       socket.to(`conversation:${conversationId}`).emit('user_typing', {
-        userId: socket.user.id,
+        userId,
         conversationId,
       });
     });
 
     socket.on('typing_stop', ({ conversationId }) => {
+      if (!conversationId) return;
       socket.to(`conversation:${conversationId}`).emit('user_stopped_typing', {
-        userId: socket.user.id,
+        userId,
         conversationId,
       });
     });

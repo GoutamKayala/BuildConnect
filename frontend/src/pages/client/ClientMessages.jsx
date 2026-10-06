@@ -40,12 +40,14 @@ export const ClientMessages = () => {
   const recipientParam = searchParams.get('recipientId') || searchParams.get('workerId');
 
   const { user } = useAuth();
-  const { socket } = useSocket();
+  const { socket, isConnected } = useSocket();
 
   const [conversations, setConversations] = useState([]);
   const [activeConversation, setActiveConversation] = useState(null);
   const [messages, setMessages] = useState([]);
   const [inputContent, setInputContent] = useState('');
+  const [isTyping, setIsTyping] = useState(false);
+  const typingTimeoutRef = useRef(null);
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState(false);
 
@@ -107,6 +109,7 @@ export const ClientMessages = () => {
 
   const messagesEndRef = useRef(null);
 
+  const toId = (val) => (val?._id || val)?.toString() || '';
   const currentUserId = user?._id || user?.id;
   const isWorkerRole = user?.role?.toUpperCase() === 'WORKER';
 
@@ -120,8 +123,8 @@ export const ClientMessages = () => {
       if (!conversationParam && (projectParam || recipientParam)) {
         let matched = convs.find(
           (c) =>
-            (projectParam && (c.project?._id === projectParam || c.project === projectParam)) ||
-            (recipientParam && c.participants?.some((p) => (p.user?._id || p.user)?.toString() === recipientParam.toString()))
+            (projectParam && toId(c.project?._id || c.project) === projectParam.toString()) ||
+            (recipientParam && c.participants?.some((p) => toId(p.user?._id || p.user) === recipientParam.toString()))
         );
 
         if (!matched) {
@@ -132,7 +135,7 @@ export const ClientMessages = () => {
             });
             if (createRes.data.conversation) {
               matched = createRes.data.conversation;
-              convs = [matched, ...convs.filter(c => c._id !== matched._id)];
+              convs = [matched, ...convs.filter((c) => toId(c._id) !== toId(matched._id))];
             }
           } catch (createErr) {
             console.error('Error finding or creating conversation:', createErr);
@@ -146,17 +149,33 @@ export const ClientMessages = () => {
         }
       }
 
-      setConversations(convs);
-
       if (conversationParam) {
-        const target = convs.find((c) => c._id === conversationParam);
-        if (target) setActiveConversation(target);
-        else if (convs.length > 0) setActiveConversation(convs[0]);
-      } else if (convs.length > 0 && !activeConversation) {
-        setActiveConversation(convs[0]);
+        let target = convs.find((c) => toId(c._id) === conversationParam.toString());
+        if (!target) {
+          try {
+            const single = await api.get(`/conversations/${conversationParam}`);
+            if (single.data?.conversation) {
+              target = single.data.conversation;
+              convs = [target, ...convs.filter((c) => toId(c._id) !== toId(target._id))];
+            }
+          } catch (e) {
+            console.warn('Could not load specific conversation by ID:', e);
+          }
+        }
+        setConversations(convs);
+        if (target) {
+          setActiveConversation(target);
+        } else if (convs.length > 0) {
+          setActiveConversation(convs[0]);
+        }
+      } else {
+        setConversations(convs);
+        if (convs.length > 0 && !activeConversation) {
+          setActiveConversation(convs[0]);
+        }
       }
     } catch (err) {
-      console.error(err);
+      console.error('Failed to load conversations:', err);
     } finally {
       setLoading(false);
     }
@@ -168,38 +187,53 @@ export const ClientMessages = () => {
 
   // Fetch messages for conversation
   const fetchMessages = async (convId) => {
+    if (!convId) return;
     try {
       const res = await api.get(`/conversations/${convId}/messages`);
       setMessages(res.data.messages || []);
     } catch (err) {
-      console.error(err);
+      console.error('Failed to load messages:', err);
     }
   };
 
+  // Join conversation & handle socket reconnects
   useEffect(() => {
-    if (activeConversation) {
-      fetchMessages(activeConversation._id);
-      if (socket) {
-        socket.emit('join_conversation', activeConversation._id);
-      }
+    if (!activeConversation?._id) return;
+    const convId = toId(activeConversation._id);
+    fetchMessages(convId);
+
+    if (socket) {
+      socket.emit('join_conversation', convId);
+
+      const handleConnect = () => {
+        socket.emit('join_conversation', convId);
+      };
+
+      socket.on('connect', handleConnect);
+      return () => {
+        socket.off('connect', handleConnect);
+      };
     }
-  }, [activeConversation, socket]);
+  }, [activeConversation?._id, socket]);
 
   // Live Socket.IO Updates
   useEffect(() => {
     if (!socket) return;
 
     const handleNewMessage = (msg) => {
+      const msgConvId = toId(msg.conversation);
+      const activeConvId = toId(activeConversation?._id);
+
       // 1. If it belongs to active conversation, append message
-      if (activeConversation && msg.conversation?.toString() === activeConversation._id?.toString()) {
+      if (activeConvId && msgConvId === activeConvId) {
         setMessages((prev) => {
-          if (prev.some((m) => m._id === msg._id)) return prev;
+          if (prev.some((m) => toId(m._id) === toId(msg._id))) return prev;
           return [...prev, msg];
         });
       }
       // 2. Also update lastMessage in conversations list and reorder
       setConversations((prev) => {
-        const convIndex = prev.findIndex((c) => c._id?.toString() === msg.conversation?.toString());
+        const convIndex = prev.findIndex((c) => toId(c._id) === msgConvId);
         if (convIndex !== -1) {
           const updated = [...prev];
           updated[convIndex] = {
@@ -210,20 +244,24 @@ export const ClientMessages = () => {
           const [moved] = updated.splice(convIndex, 1);
           return [moved, ...updated];
         }
+        fetchConversations();
         return prev;
       });
     };
 
     const handleMessageUpdated = (msg) => {
-      if (activeConversation && msg.conversation?.toString() === activeConversation._id?.toString()) {
-        setMessages((prev) => prev.map((m) => (m._id === msg._id ? msg : m)));
+      const msgConvId = toId(msg.conversation);
+      const activeConvId = toId(activeConversation?._id);
+      if (activeConvId && msgConvId === activeConvId) {
+        setMessages((prev) => prev.map((m) => (toId(m._id) === toId(msg._id) ? msg : m)));
       }
     };
 
     const handleConversationUpdated = (data) => {
       if (data?.conversationId) {
+        const targetId = toId(data.conversationId);
         setConversations((prev) => {
-          const index = prev.findIndex((c) => c._id === data.conversationId);
+          const index = prev.findIndex((c) => toId(c._id) === targetId);
           if (index !== -1) {
             const copy = [...prev];
             copy[index] = {
@@ -234,19 +272,36 @@ export const ClientMessages = () => {
             const [item] = copy.splice(index, 1);
             return [item, ...copy];
           }
+          fetchConversations();
           return prev;
         });
+      }
+    };
+
+    const handleUserTyping = (data) => {
+      if (toId(data?.conversationId) === toId(activeConversation?._id)) {
+        setIsTyping(true);
+      }
+    };
+
+    const handleUserStoppedTyping = (data) => {
+      if (toId(data?.conversationId) === toId(activeConversation?._id)) {
+        setIsTyping(false);
       }
     };
 
     socket.on('new_message', handleNewMessage);
     socket.on('message_updated', handleMessageUpdated);
     socket.on('conversation_updated', handleConversationUpdated);
+    socket.on('user_typing', handleUserTyping);
+    socket.on('user_stopped_typing', handleUserStoppedTyping);
 
     return () => {
       socket.off('new_message', handleNewMessage);
       socket.off('message_updated', handleMessageUpdated);
       socket.off('conversation_updated', handleConversationUpdated);
+      socket.off('user_typing', handleUserTyping);
+      socket.off('user_stopped_typing', handleUserStoppedTyping);
     };
   }, [socket, activeConversation]);
 
@@ -330,29 +385,47 @@ export const ClientMessages = () => {
     return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(parts.join(', '))}`;
   };
 
+  const handleInputChange = (e) => {
+    setInputContent(e.target.value);
+    if (!socket || !activeConversation?._id) return;
+    socket.emit('typing_start', { conversationId: activeConversation._id });
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    typingTimeoutRef.current = setTimeout(() => {
+      if (socket && activeConversation?._id) {
+        socket.emit('typing_stop', { conversationId: activeConversation._id });
+      }
+    }, 2000);
+  };
+
   const handleSendMessage = async (e) => {
     e.preventDefault();
     if (!inputContent.trim() || !activeConversation) return;
 
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    if (socket && activeConversation?._id) {
+      socket.emit('typing_stop', { conversationId: activeConversation._id });
+    }
+
     const other = getOtherParticipant(activeConversation);
+    const otherId = toId(other?._id || other);
     const contentToSend = inputContent.trim();
     setInputContent('');
 
     try {
       const res = await api.post('/conversations/messages', {
         conversationId: activeConversation._id,
-        recipientId: other?._id || other,
+        recipientId: otherId,
         content: contentToSend,
       });
 
       if (res.data.message) {
         const newMsg = res.data.message;
         setMessages((prev) => {
-          if (prev.some((m) => m._id === newMsg._id)) return prev;
+          if (prev.some((m) => toId(m._id) === toId(newMsg._id))) return prev;
           return [...prev, newMsg];
         });
         setConversations((prev) => {
-          const idx = prev.findIndex((c) => c._id === activeConversation._id);
+          const idx = prev.findIndex((c) => toId(c._id) === toId(activeConversation._id));
           if (idx !== -1) {
             const copy = [...prev];
             copy[idx] = {
@@ -750,6 +823,17 @@ export const ClientMessages = () => {
                       <span className="text-[10px] bg-blue-50 text-blue-700 px-2 py-0.5 rounded-full font-bold border border-blue-100">
                         {otherUser?.role === 'WORKER' ? 'Pro' : 'Client'}
                       </span>
+                      {isConnected ? (
+                        <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200">
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                          Live
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 text-[11px] font-medium text-amber-600 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200" title="Syncing socket connection">
+                          <span className="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
+                          Syncing
+                        </span>
+                      )}
                     </div>
                     <p className="text-xs text-slate-500 truncate max-w-[150px] sm:max-w-none">
                       {otherUser?.city ? `📍 ${otherUser.city}` : 'BuildConnect Secure Chat'}
@@ -1164,6 +1248,16 @@ export const ClientMessages = () => {
                     );
                   })
                 )}
+                {isTyping && (
+                  <div className="flex items-center gap-2 text-xs text-slate-500 italic px-2 py-1 bg-slate-50 rounded-lg w-fit border border-slate-100">
+                    <span className="flex gap-1 items-center">
+                      <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-bounce"></span>
+                      <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-bounce [animation-delay:0.2s]"></span>
+                      <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-bounce [animation-delay:0.4s]"></span>
+                    </span>
+                    <span>{otherUser?.name || 'Contact'} is typing...</span>
+                  </div>
+                )}
                 <div ref={messagesEndRef} />
               </div>
 
@@ -1173,7 +1267,7 @@ export const ClientMessages = () => {
                   type="text"
                   placeholder="Type a message or discuss work pricing..."
                   value={inputContent}
-                  onChange={(e) => setInputContent(e.target.value)}
+                  onChange={handleInputChange}
                   className="flex-1 px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm font-medium focus:outline-none focus:border-blue-500"
                 />
                 <button

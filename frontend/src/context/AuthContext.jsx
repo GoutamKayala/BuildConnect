@@ -7,12 +7,29 @@ export const AuthProvider = ({ children }) => {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
 
+  const saveTokens = (data) => {
+    if (data?.accessToken) {
+      localStorage.setItem('accessToken', data.accessToken);
+    }
+    if (data?.refreshToken) {
+      localStorage.setItem('refreshToken', data.refreshToken);
+    }
+  };
+
+  const clearTokens = () => {
+    localStorage.removeItem('accessToken');
+    localStorage.removeItem('refreshToken');
+  };
+
   const fetchUser = async () => {
     try {
       const res = await api.get('/auth/me');
       setUser(res.data.user);
     } catch (err) {
       setUser(null);
+      if (err.response?.status === 401) {
+        clearTokens();
+      }
     } finally {
       setLoading(false);
     }
@@ -24,12 +41,14 @@ export const AuthProvider = ({ children }) => {
 
   const login = async (email, password) => {
     const res = await api.post('/auth/login', { email, password });
+    saveTokens(res.data);
     setUser(res.data.user);
     return res.data;
   };
 
   const register = async (userData) => {
     const res = await api.post('/auth/register', userData);
+    saveTokens(res.data);
     setUser(res.data.user);
     return res.data;
   };
@@ -51,6 +70,7 @@ export const AuthProvider = ({ children }) => {
         : { ...authParam, role: authParam.role || role };
 
     const res = await api.post('/auth/google', payload);
+    saveTokens(res.data);
     setUser(res.data.user);
     return res.data;
   };
@@ -60,6 +80,7 @@ export const AuthProvider = ({ children }) => {
       await api.post('/auth/logout');
     } catch (e) {
     } finally {
+      clearTokens();
       setUser(null);
     }
   };
